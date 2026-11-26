@@ -116,3 +116,68 @@ def test_column_overrides_win(tmp_path):
     assert res.df.loc[0, "date"] == pd.Timestamp("2026-01-01")
     assert res.df.loc[0, "source"] == "rakuten"
     assert res.df.loc[0, "conversions"] == 9.0
+
+
+# --- European decimal commas & localized dates (issue #1) -------------------
+from evc_landing_estimator.adapters import (  # noqa: E402
+    _clean_numeric_series,
+    _parse_localized_dates,
+)
+
+
+def test_clean_numeric_us_thousands_not_misread():
+    # US exports: comma is a thousands group, never a decimal point.
+    s = _clean_numeric_series(pd.Series(["1,025", "1,067", "12,500", "42"]))
+    assert s.tolist() == [1025.0, 1067.0, 12500.0, 42.0]
+
+
+def test_clean_numeric_eu_decimal_comma():
+    # EU exports: comma is the decimal separator.
+    s = _clean_numeric_series(pd.Series(["12,5", "0,25", "1,2345", "3,0"]))
+    assert s.tolist() == [12.5, 0.25, 1.2345, 3.0]
+
+
+def test_clean_numeric_eu_dot_grouping_and_mixed():
+    # 1.234 -> one thousand two hundred thirty-four (dot = thousands group)
+    # 1.234,56 -> 1234.56 (dot groups, comma decimals)
+    s = _clean_numeric_series(pd.Series(["1.234", "1.234,56", "12.345.678"]))
+    assert s.tolist() == [1234.0, 1234.56, 12345678.0]
+
+
+def test_clean_numeric_unparseable_stays_nan():
+    # Unparseable values must NOT be silently coerced to 0.
+    s = _clean_numeric_series(pd.Series(["n/a", "abc", "42"]))
+    assert pd.isna(s.iloc[0])
+    assert pd.isna(s.iloc[1])
+    assert s.iloc[2] == 42.0
+
+
+def test_localized_dates_day_first_and_unambiguous_month_first():
+    parsed = _parse_localized_dates(
+        pd.Series(["03/04/2026", "13/04/2026", "04/13/2026", "2026-04-03"])
+    )
+    # 03/04 -> 3 April (day-first European default)
+    assert parsed.iloc[0] == pd.Timestamp("2026-04-03")
+    # 13/04 -> day 13 forces day-first
+    assert parsed.iloc[1] == pd.Timestamp("2026-04-13")
+    # 04/13 -> month 13 impossible, so it is month-first (US)
+    assert parsed.iloc[2] == pd.Timestamp("2026-04-13")
+    # ISO passes through
+    assert parsed.iloc[3] == pd.Timestamp("2026-04-03")
+
+
+def test_eu_google_ads_csv_end_to_end(tmp_path):
+    # A Google Ads export with EU number formatting and DD/MM/YYYY dates.
+    p = tmp_path / "ads_eu.csv"
+    p.write_text(
+        "Day,Engaged-view conversions\n"
+        "03/04/2026,\"1.234,5\"\n"
+        "04/04/2026,\"12,5\"\n"
+        "05/04/2026,42\n",
+        encoding="utf-8",
+    )
+    evc = load_evc(p)
+    assert len(evc) == 3
+    assert evc.loc[pd.Timestamp("2026-04-03")] == 1234.5
+    assert evc.loc[pd.Timestamp("2026-04-04")] == 12.5
+    assert evc.loc[pd.Timestamp("2026-04-05")] == 42.0
